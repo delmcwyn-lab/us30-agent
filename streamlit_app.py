@@ -4,8 +4,8 @@ import pandas as pd
 import numpy as np
 from scipy import stats
 from GoogleNews import GoogleNews
-import time
 import google.generativeai as genai
+import time
 
 # --- PAGE SETUP ---
 st.set_page_config(page_title="US30 AI Agent", page_icon="📈", layout="centered")
@@ -16,7 +16,25 @@ with st.sidebar:
     st.header("⚙️ Settings")
     API_KEY = st.text_input("Gemini API Key", type="password")
     
-    # Optional: Let you adjust filters on the fly
+    # --- NEW: AUTO-DETECT MODELS ---
+    valid_models = []
+    if API_KEY:
+        try:
+            genai.configure(api_key=API_KEY)
+            # List all models that support generating content
+            for m in genai.list_models():
+                if 'generateContent' in m.supported_generation_methods:
+                    valid_models.append(m.name)
+        except:
+            pass
+            
+    # Default to a safe bet if list is empty, otherwise let user pick
+    if not valid_models:
+        valid_models = ["models/gemini-1.5-flash", "models/gemini-pro"]
+        
+    selected_model = st.selectbox("🤖 AI Model", valid_models, index=0)
+    
+    st.divider()
     MIN_R2 = st.slider("Min Smoothness (R²)", 0.0, 1.0, 0.5)
     MIN_RVOL = st.slider("Min Relative Vol (RVOL)", 0.0, 3.0, 0.5)
 
@@ -36,6 +54,7 @@ def get_top_performers(tickers, top_n=10):
     
     for i, ticker in enumerate(tickers):
         try:
+            # Retry logic
             for _ in range(3):
                 try:
                     df = yf.download(ticker, period="1y", progress=False, auto_adjust=True)
@@ -43,6 +62,7 @@ def get_top_performers(tickers, top_n=10):
                 except:
                     time.sleep(1)
             
+            # Multi-index fix
             if isinstance(df.columns, pd.MultiIndex):
                 try: df = df.xs(ticker, level=1, axis=1)
                 except: pass
@@ -55,7 +75,6 @@ def get_top_performers(tickers, top_n=10):
                 performance.append((ticker, float(perf_pct)))
         except: continue
         
-        # Update progress
         progress_bar.progress((i + 1) / len(tickers))
 
     status_text.empty()
@@ -66,11 +85,14 @@ def get_top_performers(tickers, top_n=10):
 def check_hourly_technicals(ticker):
     try:
         df = yf.download(ticker, period="1mo", interval="1h", progress=False, auto_adjust=True)
-        if not df.empty: df = df.iloc[:-1] # Drop incomplete candle
-        if len(df) < 20: return None
+        # Drop incomplete candle
+        if not df.empty: df = df.iloc[:-1] 
         
+        if df.empty or len(df) < 20: return None
         if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+        
         recent = df.tail(14)
+        if 'Close' not in df.columns or 'Volume' not in df.columns: return None
         
         y = recent['Close'].values.flatten()
         x = np.arange(len(y))
@@ -99,7 +121,7 @@ def get_better_news(ticker):
         return "\n".join(headlines) if headlines else "No significant news."
     except: return "News fetch error."
 
-def ask_gemini(shortlist_data, api_key):
+def ask_gemini(shortlist_data, api_key, model_name):
     genai.configure(api_key=api_key)
     stocks_text = ""
     for s in shortlist_data:
@@ -125,7 +147,8 @@ def ask_gemini(shortlist_data, api_key):
     """
     
     try:
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        # Use the user-selected model
+        model = genai.GenerativeModel(model_name)
         response = model.generate_content(prompt)
         return response.text
     except Exception as e:
@@ -158,13 +181,13 @@ if st.button("🚀 Generate Analysis"):
                     d['news'] = get_better_news(d['ticker'])
                     shortlist.append(d)
             
-            st.success(f"Found {len(shortlist)} stocks passing strict filters.")
+            st.success(f"Found {len(shortlist)} stocks passing filters.")
             
             # 4. GEMINI DECISION
             if shortlist:
                 st.subheader("🤖 Gemini Recommendation")
-                with st.spinner("Gemini is thinking..."):
-                    result = ask_gemini(shortlist, API_KEY)
+                with st.spinner(f"Asking {selected_model}..."):
+                    result = ask_gemini(shortlist, API_KEY, selected_model)
                     st.markdown(result)
             else:
-                st.warning("No stocks met the strict criteria right now.")
+                st.warning("No stocks met the criteria (Try lowering the settings in the sidebar).")
