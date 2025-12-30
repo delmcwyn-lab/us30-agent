@@ -8,33 +8,41 @@ import google.generativeai as genai
 import time
 
 # --- PAGE SETUP ---
-st.set_page_config(page_title="US30 AI Agent", page_icon="📈", layout="centered")
-st.title("📈 US30 AI Trading Agent")
+st.set_page_config(page_title="US30 Pro Agent", page_icon="💎", layout="centered")
+st.title("💎 US30 Pro AI Agent")
+st.caption("Upgrades: Analyst Ratings + ATR Position Sizing")
 
 # --- SIDEBAR: SETTINGS ---
 with st.sidebar:
-    st.header("⚙️ Settings")
+    st.header("⚙️ Configuration")
+    
+    # 1. API Key & Model
     API_KEY = st.text_input("Gemini API Key", type="password")
     
-    # --- NEW: AUTO-DETECT MODELS ---
     valid_models = []
     if API_KEY:
         try:
             genai.configure(api_key=API_KEY)
-            # List all models that support generating content
             for m in genai.list_models():
                 if 'generateContent' in m.supported_generation_methods:
                     valid_models.append(m.name)
-        except:
-            pass
-            
-    # Default to a safe bet if list is empty, otherwise let user pick
+        except: pass
     if not valid_models:
         valid_models = ["models/gemini-1.5-flash", "models/gemini-pro"]
-        
-    selected_model = st.selectbox("🤖 AI Model", valid_models, index=0)
+    
+    selected_model = st.selectbox("AI Model", valid_models, index=0)
     
     st.divider()
+    
+    # 2. Risk Management Inputs (Upgrade 3)
+    st.subheader("💰 Risk Management")
+    RISK_AMOUNT = st.number_input("Risk per Trade ($)", min_value=10.0, value=100.0, step=10.0)
+    ATR_MULTIPLIER = st.slider("Stop Loss Width (x ATR)", 1.0, 3.0, 1.5, help="1.5x ATR is standard for intraday.")
+    
+    st.divider()
+    
+    # 3. Filters
+    st.subheader("🔍 Filters")
     MIN_R2 = st.slider("Min Smoothness (R²)", 0.0, 1.0, 0.5)
     MIN_RVOL = st.slider("Min Relative Vol (RVOL)", 0.0, 3.0, 0.5)
 
@@ -48,21 +56,17 @@ US30_TICKERS = [
 def get_top_performers(tickers, top_n=10):
     status_text = st.empty()
     status_text.text(f"Scanning US30 for Top {top_n} Performers...")
-    
     performance = []
     progress_bar = st.progress(0)
     
     for i, ticker in enumerate(tickers):
         try:
-            # Retry logic
             for _ in range(3):
                 try:
                     df = yf.download(ticker, period="1y", progress=False, auto_adjust=True)
                     break
-                except:
-                    time.sleep(1)
+                except: time.sleep(1)
             
-            # Multi-index fix
             if isinstance(df.columns, pd.MultiIndex):
                 try: df = df.xs(ticker, level=1, axis=1)
                 except: pass
@@ -74,7 +78,6 @@ def get_top_performers(tickers, top_n=10):
                 perf_pct = ((end_p - start_p) / start_p) * 100
                 performance.append((ticker, float(perf_pct)))
         except: continue
-        
         progress_bar.progress((i + 1) / len(tickers))
 
     status_text.empty()
@@ -82,18 +85,40 @@ def get_top_performers(tickers, top_n=10):
     sorted_perf = sorted(performance, key=lambda x: x[1], reverse=True)
     return [x[0] for x in sorted_perf[:top_n]]
 
-def check_hourly_technicals(ticker):
+def get_advanced_technicals(ticker):
+    """
+    Fetches Price, R2, RVOL, Analyst Data, and Calculates ATR (12).
+    """
     try:
+        # 1. Analyst Data (Upgrade 1)
+        t_obj = yf.Ticker(ticker)
+        info = t_obj.info
+        analyst_target = info.get('targetMeanPrice', 'N/A')
+        analyst_rating = info.get('recommendationKey', 'N/A').upper().replace("_", " ")
+
+        # 2. Intraday Data (1 Hour)
         df = yf.download(ticker, period="1mo", interval="1h", progress=False, auto_adjust=True)
-        # Drop incomplete candle
-        if not df.empty: df = df.iloc[:-1] 
-        
+        if not df.empty: df = df.iloc[:-1] # Drop incomplete candle
         if df.empty or len(df) < 20: return None
+        
         if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
         
-        recent = df.tail(14)
-        if 'Close' not in df.columns or 'Volume' not in df.columns: return None
+        # 3. Calculate ATR (12 Period) - Upgrade 3
+        # True Range Calculation
+        high = df['High']
+        low = df['Low']
+        close = df['Close']
+        prev_close = close.shift(1)
         
+        tr1 = high - low
+        tr2 = (high - prev_close).abs()
+        tr3 = (low - prev_close).abs()
+        
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        atr_12 = tr.rolling(window=12).mean().iloc[-1]
+
+        # 4. Standard Technicals (R2 & RVOL)
+        recent = df.tail(14)
         y = recent['Close'].values.flatten()
         x = np.arange(len(y))
         slope, _, r_value, _, _ = stats.linregress(x, y)
@@ -105,12 +130,16 @@ def check_hourly_technicals(ticker):
         
         return {
             "ticker": ticker,
+            "price": round(float(y[-1]), 2),
+            "trend": "UP" if slope > 0 else "DOWN",
             "r2": round(r_squared, 3),
             "rvol": round(float(rvol), 2),
-            "trend": "UP" if slope > 0 else "DOWN",
-            "price": round(float(y[-1]), 2)
+            "analyst_rating": analyst_rating,
+            "analyst_target": analyst_target,
+            "atr": round(float(atr_12), 2)
         }
-    except: return None
+    except Exception as e:
+        return None
 
 def get_better_news(ticker):
     try:
@@ -121,33 +150,52 @@ def get_better_news(ticker):
         return "\n".join(headlines) if headlines else "No significant news."
     except: return "News fetch error."
 
-def ask_gemini(shortlist_data, api_key, model_name):
+def ask_gemini(shortlist_data, api_key, model_name, risk_amt, atr_mult):
     genai.configure(api_key=api_key)
+    
     stocks_text = ""
     for s in shortlist_data:
-        stocks_text += f"TICKER: {s['ticker']} (${s['price']}) | Trend: {s['trend']} | R2: {s['r2']} | RVOL: {s['rvol']}\nNEWS: {s['news']}\n---\n"
+        stocks_text += f"""
+        TICKER: {s['ticker']} (Current Price: ${s['price']})
+        - Trend: {s['trend']} | Smoothness(R2): {s['r2']} | RVOL: {s['rvol']}
+        - ANALYST RATING: {s['analyst_rating']} | TARGET: ${s['analyst_target']}
+        - ATR (VOLATILITY): ${s['atr']}
+        - NEWS: {s['news']}
+        ----------------------------------------------
+        """
 
     prompt = f"""
-    You are an Elite Intraday Trading Algorithm.
-    Analyze these stocks and pick the SINGLE best setup for a 1-hour trade.
+    You are an Elite Risk-Managed Trading Algorithm.
+    User Risk Budget: ${risk_amt} per trade.
+    Stop Loss Rule: Must be exactly {atr_mult}x ATR away from Entry.
+    
+    MISSION:
+    1. Select the SINGLE best stock based on Technical Trend + Analyst Confluence + News.
+    2. Calculate the Position Size (Shares) using this formula:
+       Shares = {risk_amt} / (Entry Price - Stop Loss Price)
     
     DATA:
     {stocks_text}
     
-    OUTPUT FORMAT:
-    SELECTED STOCK: [Ticker]
-    RATIONALE: [One sentence reason]
-    SENTIMENT: [Bullish/Bearish]
+    OUTPUT FORMAT (Strictly follow):
     
-    TRADE PLAN:
-    - ACTION: [BUY / SELL]
-    - ENTRY: [Price]
-    - STOP LOSS: [Price ~0.5% away]
-    - TAKE PROFIT: [Price ~1.0% away]
+    ### 🏆 SELECTED STOCK: [Ticker]
+    **Rationale:** [Why Technicals + Analysts + News align]
+    **Analyst Verdict:** [Rating & Target]
+    
+    ### 📉 TRADE PLAN (1-Hour Chart)
+    * **Action:** [BUY / SELL]
+    * **Entry:** [Current Price or slight pullback]
+    * **Stop Loss:** [Calculate: Entry - ({atr_mult} * ATR)]
+    * **Take Profit:** [Set at 1.5x or 2x reward relative to risk]
+    
+    ### ⚖️ POSITION SIZING (Risk: ${risk_amt})
+    * **ATR Value:** $[Value]
+    * **Stop Distance:** $[Value of {atr_mult} * ATR]
+    * **QUANTITY:** [Calculated Number] Shares/Lots
     """
     
     try:
-        # Use the user-selected model
         model = genai.GenerativeModel(model_name)
         response = model.generate_content(prompt)
         return response.text
@@ -155,26 +203,30 @@ def ask_gemini(shortlist_data, api_key, model_name):
         return f"Error: {e}"
 
 # --- MAIN APP UI ---
-if st.button("🚀 Generate Analysis"):
+if st.button("🚀 Generate Pro Analysis"):
     if not API_KEY:
         st.error("Please enter your API Key in the sidebar first!")
     else:
         # 1. SCAN
         top_list = get_top_performers(US30_TICKERS)
         
-        # 2. FILTER
+        # 2. PROCESS & FILTER
         data_list = []
-        for t in top_list:
-            d = check_hourly_technicals(t)
-            if d: data_list.append(d)
+        status = st.empty()
+        status.text("Calculating ATR, Analyst Ratings, and Technicals...")
         
-        # Show Dashboard Table
+        for t in top_list:
+            d = get_advanced_technicals(t)
+            if d: data_list.append(d)
+        status.empty()
+        
+        # Show Dashboard
         if data_list:
-            df_display = pd.DataFrame(data_list)[['ticker', 'rvol', 'r2', 'trend']]
-            st.subheader("📊 Live Market Dashboard")
+            df_display = pd.DataFrame(data_list)[['ticker', 'rvol', 'r2', 'atr', 'analyst_rating']]
+            st.subheader("📊 Market Data")
             st.dataframe(df_display.sort_values(by='rvol', ascending=False), use_container_width=True)
 
-            # 3. AI SHORTLIST
+            # 3. SHORTLIST
             shortlist = []
             for d in data_list:
                 if d['r2'] > MIN_R2 and d['rvol'] > MIN_RVOL:
@@ -185,9 +237,9 @@ if st.button("🚀 Generate Analysis"):
             
             # 4. GEMINI DECISION
             if shortlist:
-                st.subheader("🤖 Gemini Recommendation")
-                with st.spinner(f"Asking {selected_model}..."):
-                    result = ask_gemini(shortlist, API_KEY, selected_model)
+                st.subheader("🤖 AI Trade Recommendation")
+                with st.spinner(f"Gemini is sizing your trade (Risk: ${RISK_AMOUNT})..."):
+                    result = ask_gemini(shortlist, API_KEY, selected_model, RISK_AMOUNT, ATR_MULTIPLIER)
                     st.markdown(result)
             else:
-                st.warning("No stocks met the criteria (Try lowering the settings in the sidebar).")
+                st.warning("No stocks met the strict criteria. Try lowering filters.")
